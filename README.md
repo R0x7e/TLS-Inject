@@ -11,6 +11,7 @@
   - 如果目标文件 **没有** TLS 表：创建全新的 `IMAGE_TLS_DIRECTORY64` 结构，并将其添加到数据目录表中。
   - 如果目标文件 **已有** TLS 表：保留原有回调函数，将新的 Shellcode 地址追加到回调函数数组末尾，实现无损注入。
 - **ASLR 处理**：自动禁用动态基址（Dynamic Base），确保硬编码的绝对地址（VA）在运行时有效。
+- **Loader Lock 绕过**：引入了 **Thread Loader** 机制，避免在 TLS 回调中直接运行复杂 Shellcode 导致的死锁问题。
 
 ---
 
@@ -41,10 +42,34 @@ typedef struct _IMAGE_TLS_DIRECTORY64 {
 
 ---
 
-## 3. 项目结构说明
+## 3. 技术难点与解决方案
+
+### 3.1 Loader Lock 死锁 (Loader Lock Deadlock)
+**问题描述**：
+TLS 回调是在 `LdrpCallInitRoutine` 阶段执行的，此时系统持有一个全局的 **Loader Lock**（加载器锁）。如果在 TLS 回调中调用了需要获取 Loader Lock 的 API（例如 `LoadLibrary`、`GetProcAddress` 甚至某些涉及堆分配的函数），就会导致**死锁**，进程会挂起，永远无法进入 `main` 函数。
+
+**解决方案**：
+引入一段微小的汇编引导代码 (**Thread Loader**)，它的逻辑非常简单且不依赖任何 DLL：
+1. 通过 **PEB (Process Environment Block)** 手动查找 `kernel32.dll` 基址。
+2. 遍历导出表查找 `CreateThread` 函数地址。
+3. 调用 `CreateThread` 创建一个新线程来运行真正的 Shellcode。
+4. **立即返回**。
+
+这样，TLS 回调会迅速结束并释放 Loader Lock，主程序可以正常启动，而 Shellcode 在后台线程中并行运行。
+
+### 3.2 ASLR (地址空间布局随机化)
+**问题描述**：
+TLS 回调数组中存储的是**绝对虚拟地址 (VA)**。如果目标程序开启了 ASLR，每次加载的基址都会变化，导致硬编码的 VA 失效。
+
+**解决方案**：
+在注入时，修改 PE 头中的 `OptionalHeader.DllCharacteristics`，移除 `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE` 标志，强制关闭 ASLR。
+
+---
+
+## 4. 项目结构说明
 
 - **`injector.cpp`**: 
-  - **核心工具**。负责读取目标 PE 文件，计算新节区位置，写入 Shellcode，构建/修改 TLS 目录结构，并生成注入后的可执行文件。
+  - **核心工具**。包含 PE 解析、节区注入、TLS 结构构建、ASLR 禁用以及 Thread Loader 汇编代码。
   - [查看代码](injector.cpp)
 
 - **`target.cpp`**:
@@ -58,39 +83,6 @@ typedef struct _IMAGE_TLS_DIRECTORY64 {
 - **`CMakeLists.txt`**:
   - CMake 构建脚本，用于编译上述所有程序。
   - [查看代码](CMakeLists.txt)
-
----
-
-## 4. 注入流程详解 (Implementation Details)
-
-`injector.cpp` 的工作流程如下：
-
-1. **文件读取与验证**：
-   - 读取目标 PE 文件到内存。
-   - 验证 DOS 签名 (`MZ`) 和 NT 签名 (`PE\0\0`)。
-   - 检查是否为 64 位程序 (`IMAGE_NT_OPTIONAL_HDR64_MAGIC`)。
-
-2. **添加新节区 (.tlsinj)**：
-   - 在节表末尾构造一个新的 `IMAGE_SECTION_HEADER`。
-   - 设置属性为 `RWE` (Read | Write | Execute)，确保 Shellcode 可执行且数据可写。
-   - 计算新节区的虚拟地址 (VirtualAddress) 和文件偏移 (PointerToRawData)。
-
-3. **Shellcode 植入**：
-   - 将准备好的 x64 Shellcode（默认为弹计算器或死循环）写入新节区的开头。
-
-4. **处理 TLS 目录**：
-   - **情况 A：目标无 TLS 表**
-     - 在新节区中构造一个 `IMAGE_TLS_DIRECTORY64` 结构体。
-     - 构造一个回调数组：`{ Shellcode_VA, 0 }`。
-     - 将数据目录表 `IMAGE_DIRECTORY_ENTRY_TLS` 指向新构造的结构体。
-   - **情况 B：目标有 TLS 表**
-     - 解析原有的 TLS 目录，找到原回调数组。
-     - 将原数组内容复制到新节区，并在末尾追加我们的 Shellcode 地址。
-     - 更新原 TLS 目录的 `AddressOfCallBacks` 指针，使其指向新的数组。
-
-5. **禁用 ASLR**：
-   - 修改 `OptionalHeader.DllCharacteristics`，移除 `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE` 标志。
-   - **原因**：TLS 回调数组中存储的是绝对虚拟地址（VA）。如果开启 ASLR，程序加载基址随机化，硬编码的 VA 将失效导致崩溃。
 
 ---
 
@@ -128,7 +120,9 @@ cmake --build .
 
 3. **验证结果**：
    运行生成的 `target_injected.exe`。
-   - **预期行为**：程序启动时，先弹出一个计算器（或卡住，取决于 Shellcode），关闭计算器后，控制台才输出 "Target Main function executed!"。
+   - **预期行为**：
+     1. 程序正常启动，控制台输出 "Target Main function executed!"。
+     2. Shellcode 在后台成功运行（如弹计算器或上线）。
 
 ---
 
